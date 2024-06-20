@@ -1,3 +1,12 @@
 ply==3.11
 PuLP==2.8.0
 Pyomo==6.7.3
+ortools~=9.10.4067
+fastrand~=1.8.0
+numpy~=1.26.4
+pyvpsolver~=3.1.4
+sortedcontainers~=2.4.0
+Flask~=3.0.3
+PyMPL~=1.2.1
+vpsolver~=0.0
+six~=1.16.0
