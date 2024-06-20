@@ -1,346 +1,267 @@
-"""
-See main script at the bottom (to run the code).
-"""
+import ast
+import math
+from ortools.sat.python import cp_model
+from pyvpsolver.solvers import mvpsolver
+from sortedcontainers import SortedList
+import test_data
 
-from test_data import TEST_DATA
-
-import pulp
-from pulp.apis import PULP_CBC_CMD
-from pulp import lpSum
-
-from pyomo.environ import (
-    ConcreteModel,
-    Var,
-    Objective,
-    Constraint,
-    NonNegativeIntegers,
-    SolverFactory,
-    sum_product,
-    ConstraintList,
-    minimize,
-)
-from pyomo.opt import SolverStatus, TerminationCondition
-
-from collections import Counter
-from random import shuffle
-from sys import platform
-import os
+data = test_data.TEST_DATA
 
 
-def _get_project_root_abs_path():
-    return os.path.dirname(os.path.realpath(__file__))
+class problem:
 
+    def __init__(self, p):
 
-SOLVER_TIMEOUT_SECONDS = 30
-GAP_TOLERANCE = 0.03
-if platform == "linux" or platform == "linux2":
-    venv_executable_loc = (
-        "/venv/lib/python3.11/site-packages/pulp/solverdir/cbc/linux/64/cbc"
-    )
-else:
-    # Consider as Windows
-    venv_executable_loc = r"\venv\Lib\site-packages\pulp\solverdir\cbc\win\64\cbc.exe"
-CBC_EXECUTABLE_PATH = str(_get_project_root_abs_path()) + venv_executable_loc
+        self.bars = [(key, value) for key, value in p['bars_quantities'].items()]
+        self.parts = [(key, value) for key, value in p['parts_quantities'].items()]
+        keys = [key for key, value in p['parts_quantities'].items()]
 
+        self.inv_parts, self.in_keys = {}, {}
 
-def get_var_index_from_var_name(lp_variable) -> str:
-    return lp_variable.name.split("x")[1]
+        for ind, bars in enumerate(self.bars):
+            self.inv_parts[bars[0]] = ind
 
+        for ind, part in enumerate(self.parts):
+            self.inv_parts[part[0]] = ind
 
-def calculate_solution_pulp(
-    combos_per_bar: dict[int, list[tuple[int, ...]]],
-    parts: list[int],
-    bars_quantities: dict[int, int],
-    log_solver_logs,  # To print out all the logs during the LP nesting process
-    timeout_seconds,
-    already_selected_patterns={},
-):
-    lp = pulp.LpProblem("amel_solution", pulp.LpMinimize)
+        self.bars_list = []
+        self.parts_list = []
 
-    all_combos = [i for v in combos_per_bar.values() for i in v]
-    combos_unique_sorted = sorted(set(all_combos), key=lambda c: (-sum(c), len(c)))
-    parts_qtys = Counter(parts)
-    all_bars_sum = sum(b for b in bars_quantities)
+        # CP_SOLVER
+        self.CP_SOLVER_TIME_LIMIT = 150
+        self.CP_SOLVER_GAP_LIMIT = 0.001
+        self.CP_NUM_CORES = 8
+        self.CP_LOGGING = 0
 
-    combos_2_total_available_bars = {}
-    for b, cs in combos_per_bar.items():
-        for c in cs:
-            if c not in combos_2_total_available_bars:
-                combos_2_total_available_bars[c] = 0
-            if bars_quantities[b] == 0:
-                combos_2_total_available_bars[c] = -1
-            if combos_2_total_available_bars[c] != -1:
-                combos_2_total_available_bars[c] += 1
+        for pt in self.parts:
+            for _ in range(pt[1]):
+                self.parts_list.append(pt[0])
+        # for bars with infinite quantity
+        # put the highest number you might need
+        for b in self.bars:
+            times = b[1]
+            if b[1] == 0:
+                times = self.find_count(b[0])
+            for _ in range(times):
+                self.bars_list.append(b[0])
 
-    # one combo is one variable
-    x = [
-        pulp.LpVariable(f"x{i}", lowBound=0, cat="Integer")
-        for i in range(len(combos_unique_sorted))
-    ]
+        # solution
+        self.best_cost = 1e20
+        self.best_solution = None
+    def find_count(self, _x):
+        _list = self.parts_list.copy()
+        _list = sorted(_list)
+        n = 1
+        left = _x
+        for it in _list:
+            if it > _x:
+                continue
+            elif it < left:
+                left -= it
+            else:
+                left = _x - it
+                n += 1
+        return n
 
-    # add objective function (only one function can be, that is why we sum it up to an expression.)
-    lp += all_bars_sum * lpSum(x)
+    def largest_in_smallest(self):
+        bl = [(cap, id_) for id_, cap in zip(range(len(self.bars_list)), self.bars_list)]
+        solution = [-1] * len(self.parts_list)
+        sl = SortedList(bl)
+        pl = sorted(self.parts_list, reverse=True)
+        for part in range(len(pl)):
+            index = sl.bisect_left((pl[part], -1))
+            if index < len(sl):
+                w, i = sl[index]
+                sl.pop(index)
+                sl.add((w - pl[part], i))
+                solution[part] = i
+        
+        return self.parse_sol(solution)
 
-    # add constraints
-    lp += all_bars_sum * lpSum(x) >= sum(
-        parts
-    )  # negative waste means solution len is larger than bars
+    # Minimizing this is equivalent to minimizing sum of sizes of unused bins
+    def loss(self, solution):
+        loss = 0
+        done = [0] * len(self.bars_list)
+        for i in range(len(solution)):
+            if solution[i] == -1:
+                loss = math.inf
+            done[solution[i]] = 1
+        for i in range(len(self.bars_list)):
+            loss += done[i] * self.bars_list[i]
+        return loss
 
-    combo_2_parts_count = {c: Counter(c) for c in combos_unique_sorted}
-    nr_of_combos = len(combos_unique_sorted)
-    for p, q in parts_qtys.items():
-        lp += (
-            lpSum(
-                x[i] * combo_2_parts_count[combos_unique_sorted[i]][p]
-                for i in range(nr_of_combos)
+    def polynomial_hash(self, arr, base=31, mod=1_000_000_007):
+        arr = sorted(arr)
+        hash_value = 0
+        for i, element in enumerate(arr):
+            hash_value = (hash_value * base + element) % mod
+        return hash_value
+
+    def score(self, solution):
+        print(f"Used total of {self.loss(solution)} , Wasting {self.loss(solution) - sum(self.parts_list)}."
+              f"\nThis amounts to {(self.loss(solution) - sum(self.parts_list)) / self.loss(solution) * 100}% of materials.")
+    # This function finds any feasible solution, it is usually very bad. if you want to minimize use
+    # cp_sat solver or VPSolver instead, its only merit is to check whether a problem is solvable, fast.
+    def parse_sol(self, solution):
+        d = {}
+        for i in range(len(solution)):
+            if solution[i] not in d:
+                d[solution[i]] = []
+            d[solution[i]].append(self.parts_list[i])
+        inverse = {}
+        for key, val in d.items():
+            inverse[self.polynomial_hash(val)] = val
+        sol = {}
+        sizes = {}
+        for key, val in self.bars:
+            sizes[key] = {}
+            sol[key] = {}
+        for key, value in d.items():
+            value = sorted(value)
+            h = self.polynomial_hash(value)
+            size = self.bars_list[key]
+            if size not in sol:
+                sol[size] = {}
+            if h not in sol[size]:
+                sol[size][h] = 0
+            sol[size][h] += 1
+
+        final = {}
+        #final = {size -> (total size, [(count, [pattern]))}
+        for key, val in self.bars:
+            final[key] = [0, []]
+        for key, val in self.bars:
+            cnt = 0
+            for key2, val2 in sol[key].items():
+                cnt += val2
+                final[key][1].append((val2, inverse[key2]))
+            final[key][0] = cnt
+        final = [(key, value) for key, value in final.items()]
+        ans = ""
+
+        for i in range(len(final)):
+            ans += f"Bar number {i} : {final[i][1][0]} Patterns:\n"
+            for j in range(0, len(final[i][1][1])):
+                cnt, pat = final[i][1][1][j][0], final[i][1][1][j][1]
+                app = list(map(lambda x:self.inv_parts[x] + 1, pat))
+                ans += f"{cnt}x {str(app)}\n"
+        print(ans)
+
+    def or_multiple_knapsack_sat(self):
+        d = {}
+
+        d['c_bins'] = len(self.bars_list)
+        d['c_parts'] = len(self.parts_list)
+        d['bins'] = self.bars_list
+        d['parts'] = self.parts_list
+
+        model = cp_model.CpModel()
+
+        x = {}
+        for i in range(d['c_parts']):
+            for j in range(d['c_bins']):
+                x[i, j] = model.new_bool_var(f"x_{i}_{j}")
+
+        for i in range(d["c_parts"]):
+            model.add_at_most_one(x[i, b] for b in range(d["c_bins"]))
+
+        for b in range(d["c_bins"]):
+            model.add(
+                sum(x[i, b] * d["parts"][i] for i in range(d["c_parts"]))
+                <= d["bins"][b]
             )
-            == q
-        )
 
-    # If bar quantities are provided than set that constraint as well. If not
-    # the algorithm will work assuming infinite amount for undefined bar.
-    for i, c in enumerate(combos_unique_sorted):
-        if combos_2_total_available_bars[c] > 0:
-            lp += x[i] <= combos_2_total_available_bars[c]
+        objective = []
+        for i in range(d["c_parts"]):
+            for b in range(d["c_bins"]):
+                objective.append(cp_model.LinearExpr.Term(x[i, b], 1))
+        model.maximize(cp_model.LinearExpr.sum(objective))
+        solver = cp_model.CpSolver()
+        status = solver.solve(model)
+        if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+            solution = [-1] * d['c_parts']
 
-    lp.solve(
-        PULP_CBC_CMD(
-            msg=log_solver_logs, timeLimit=timeout_seconds, gapRel=GAP_TOLERANCE
-        )
-    )  # Turn off printing out all the detailed messages
-    if log_solver_logs:
-        print("STATUS:", pulp.LpStatus[lp.status])
+            for bar in range(len(d['bins'])):
+                for item in range(len(d['parts'])):
+                    if solver.value(x[item, bar]) > 0:
+                        solution[item] = bar
+            return solution
+        else:
+            raise Exception('No feasible solution found')
 
-    selected_patterns = [
-        (combos_unique_sorted[int(get_var_index_from_var_name(v))], int(v.varValue))
-        for v in lp.variables()
-        if v.name != "__dummy" and v.varValue > 0
-    ]
+    def solver_sat(self):
+        d = {}
 
-    selected_patterns = sorted(selected_patterns, key=lambda x: -sum(x[0]))
+        # The main weakness of this formulation is using total_count(bars) * total_count(items) variables,
+        # which makes convergence very slow
+        d['c_bins'] = len(self.bars_list)
+        d['c_parts'] = len(self.parts_list)
+        d['bins'] = self.bars_list
+        d['parts'] = self.parts_list
 
-    bars_quantities = dict(sorted(bars_quantities.items()))
-    # Start from largest combo length and lowest bar length to find first best fits.
-    bars_combos = {}
-    empty_bar_key = ""
-    for c, n in selected_patterns:
-        combo_len = sum(c)
-        if empty_bar_key:
-            del bars_quantities[empty_bar_key]
-            empty_bar_key = ""
-        for b, q in bars_quantities.items():
-            if b >= combo_len:
-                if b not in bars_combos:
-                    bars_combos[b] = {}
+        model = cp_model.CpModel()
+        # min sum y_i a_i (y_i is binary, whether a bar is taken by any part)
+        # st:   positivity constraints on x and y
+        #       sum_i x_ij = 1 (all items are taken)
+        #       sum_i x_ij w_i <= a_j (no bin is overfilled)
+        #       yj >= max_i x_ij (big one!) (yj is the correct indicator variable or whether bin j is occupied)
 
-                if q == 0:
-                    bars_combos[b][c] = n
-                    break
-                elif q == n:
-                    bars_combos[b][c] = n
-                    bars_quantities[b] -= n
-                    empty_bar_key = b
-                    break
-                elif q > n:
-                    bars_combos[b][c] = n
-                    bars_quantities[b] -= n
-                    break
-                elif q < n:
-                    bars_combos[b][c] = q
-                    n -= q
-                    bars_quantities[b] = 0
-                    empty_bar_key = b
-                    break
+        x, y = {}, {}
+        for i in range(d['c_parts']):
+            for j in range(d['c_bins']):
+                x[i, j] = model.new_bool_var(f"x_{i}_{j}")
+        for j in range(d['c_bins']):
+            y[j] = model.new_bool_var(f"y_{j}")
 
-                else:
-                    raise Exception("Unexpected if else case.")
+        for i in range(d["c_parts"]):
+            model.add_exactly_one(x[i, b] for b in range(d["c_bins"]))
 
-    return lp.status, {**already_selected_patterns, **bars_combos}
-
-
-PROBLEMATIC_STATUSES = (SolverStatus.aborted, SolverStatus.warning)
-
-
-def calculate_solution_pyomo(
-    combos_per_bar: dict[int, list[tuple[int, ...]]],
-    parts: list[int],
-    bars_quantities: dict[int, int],
-    log_solver_logs,  # Adjust this for Pyomo logging if necessary
-    timeout_seconds,
-    already_selected_patterns={},
-):
-    """
-    This uses `pyomo` library BUT `pulp's` CBC solver, because it does not have it's own solver.
-    """
-
-    model = ConcreteModel()
-
-    all_combos = [i for v in combos_per_bar.values() for i in v]
-    combos_unique_sorted = sorted(set(all_combos), key=lambda c: (-sum(c), len(c)))
-    parts_qtys = Counter(parts)
-    all_bars_sum = sum(bars_quantities.keys())
-
-    # Variables
-    model.x = Var(range(len(combos_unique_sorted)), domain=NonNegativeIntegers)
-
-    # Objective function
-    model.objective = Objective(expr=sum(model.x[i] for i in model.x), sense=minimize)
-
-    # Constraints
-    model.constraints = ConstraintList()
-
-    # Constraint for total bar lengths
-    # (negative waste means solution len is larger than bars)
-    model.constraints.add(
-        (all_bars_sum * sum(model.x[i] for i in model.x)) >= sum(parts)
-    )
-
-    # Constraints for parts quantities
-    combo_2_parts_count = {c: Counter(c) for c in combos_unique_sorted}
-    nr_of_combos = len(combos_unique_sorted)
-    for p, q in parts_qtys.items():
-        model.constraints.add(
-            sum(
-                model.x[i] * combo_2_parts_count[combos_unique_sorted[i]].get(p, 0)
-                for i in range(nr_of_combos)
+        for b in range(d["c_bins"]):
+            model.add(
+                sum(x[i, b] * d["parts"][i] for i in range(d["c_parts"]))
+                <= d["bins"][b]
             )
-            == q
-        )
 
-    # Constraint for total available bars per combo
-    # If bar quantities are provided than set that constraint as well. If not
-    # the algorithm will work assuming infinite amount for undefined bar.
-    combos_2_total_available_bars = {c: 0 for c in all_combos}
-    for b, cs in combos_per_bar.items():
-        for c in cs:
-            if bars_quantities[b] == 0:
-                combos_2_total_available_bars[c] = -1
-            elif combos_2_total_available_bars[c] != -1:
-                combos_2_total_available_bars[c] += 1
+        for j in range(d["c_bins"]):
+            model.add_max_equality(y[j], [x[i, j] for i in range(d['c_parts'])])
 
-    for i, c in enumerate(combos_unique_sorted):
-        if combos_2_total_available_bars[c] > 0:
-            model.constraints.add(model.x[i] <= combos_2_total_available_bars[c])
+        objective = []
+        for j in range(d["c_bins"]):
+            objective.append(cp_model.LinearExpr.Term(y[j], d['bins'][j]))
+        model.minimize(cp_model.LinearExpr.sum(objective))
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = self.CP_SOLVER_TIME_LIMIT
+        solver.parameters.relative_gap_limit = self.CP_SOLVER_GAP_LIMIT
+        solver.parameters.num_workers = self.CP_NUM_CORES
 
-    # Solve the model
-    SOLVER_NAME_PYOMO = "cbc"
-    solver = SolverFactory(SOLVER_NAME_PYOMO, executable=CBC_EXECUTABLE_PATH)
-    if "cbc" in SOLVER_NAME_PYOMO:
-        solver.options["seconds"] = timeout_seconds
-    else:
-        raise ValueError(f"Unkwnon solver name provided '{SOLVER_NAME_PYOMO}'.")
-    if log_solver_logs:
-        solver.options["log"] = 1  # Adjust as necessary for Pyomo/CBC
-    results = solver.solve(model, tee=log_solver_logs)
+        solver.parameters.log_search_progress = self.CP_LOGGING
+        solver.log_callback = print
 
-    if results.Solver.Status in PROBLEMATIC_STATUSES:
-        raise Exception(f"Timeout limit reached. Status: {results.Solver.Status}")
+        status = solver.solve(model)
 
-    # Loading solution into results object
-    model.solutions.load_from(results)
+        print(solver.status_name(status))
+        solution = [-1] * d['c_parts']
 
-    if log_solver_logs:
-        print("SolverStatus:", results.solver.status)
-        print("Termination condition:", results.solver.termination_condition)
-    if results.solver.status == SolverStatus.ok:
-        status = 1
-    else:
-        status = -1
+        for bar in range(len(d['bins'])):
+            for item in range(len(d['parts'])):
+                if solver.value(x[item, bar]) > 0:
+                    solution[item] = bar
 
-    selected_patterns = [
-        (combos_unique_sorted[i], model.x[i].value)
-        for i in model.x
-        if model.x[i].value > 0
-    ]
-    selected_patterns = sorted(selected_patterns, key=lambda x: -sum(x[0]))
+        return self.parse_sol(solution)
 
-    bars_quantities = dict(sorted(bars_quantities.items()))
-    # Start from largest combo length and lowest bar length to find first best fits.
-    bars_combos = {}
-    empty_bar_key = ""
-    for c, n in selected_patterns:
-        combo_len = sum(c)
-        if empty_bar_key:
-            del bars_quantities[empty_bar_key]
-            empty_bar_key = ""
-        for b, q in bars_quantities.items():
-            if b >= combo_len:
-                # Initialize empty bar counter
-                if b not in bars_combos:
-                    bars_combos[b] = {}
+    def VP(self):
+        Ws = [[key] for key, val in self.bars]
+        Cs = [key for key, val in self.bars]
+        Qs = [-1 if val <= 0 else val for key, val in self.bars]
+        ws = [[[part]] for part, count in self.parts]
+        b = [count for part, count in self.parts]
 
-                if q == 0:
-                    bars_combos[b][c] = n
-                    break
-                elif q == n:
-                    bars_combos[b][c] = n
-                    bars_quantities[b] -= n
-                    empty_bar_key = b
-                    break
-                elif q > n:
-                    bars_combos[b][c] = n
-                    bars_quantities[b] -= n
-                    break
-                elif q < n:
-                    bars_combos[b][c] = q
-                    n -= q
-                    bars_quantities[b] = 0
-                    empty_bar_key = b
-                    break
+        sol = mvpsolver.solve(Ws, Cs, Qs, ws, b, script="vpsolver_glpk.sh")
 
-                else:
-                    raise Exception("Unexpected if else case.")
-
-    return status, {**already_selected_patterns, **bars_combos}
-
-
-def calculate_solution(
-    method,
-    combos_per_bar: dict[int, list[tuple[int, ...]]],
-    parts: list[int],
-    bars_quantities: dict[int, int],
-    log_solver_logs=False,  # To print out all the logs during the LP nesting process
-    timeout_seconds=300,
-    already_selected_patterns={},
-):
-    args = (
-        combos_per_bar,
-        parts,
-        bars_quantities,
-        log_solver_logs,
-        timeout_seconds,
-        already_selected_patterns,
-    )
-    if method == 1:
-        return calculate_solution_pulp(*args)
-    elif method == 2:
-        return calculate_solution_pyomo(*args)
-    raise Exception("Wrong method number selected.")
-
-
-def _get_parts_list(parts_quantities: dict):
-    return [l for l, q in parts_quantities.items() for _ in range(q)]
-
-
-METHOD_PULP = 1
-METHOD_PYOMO = 2
-
-if __name__ == "__main__":
-
-    TEST_CASE = 2  # NOTE: change this for different cases (add into data.py own cases)
-
-    _td = TEST_DATA[TEST_CASE]
-    status, results = calculate_solution(
-        method=METHOD_PULP,
-        combos_per_bar=_td["possible_combos_per_bar"],
-        parts=_get_parts_list(_td["parts_quantities"]),
-        bars_quantities=_td["bars_quantities"],
-    )
-
-    # Print out results:
-    print("Status:", status)
-    print("Combinations per bar:")
-    for bar, combos in results.items():
-        print("bar:", bar)
-        for combo, repetitions in combos.items():
-            print("     ", combo, "x", repetitions)
+        mvpsolver.print_solution(sol)
+        return sol
+#Usage:
+#p = problem(TEST_CASE)
+#p.vp()
+#p.solve_sat()
+#p.largest_in_smallest()
