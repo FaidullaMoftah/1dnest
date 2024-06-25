@@ -75,8 +75,7 @@ class problem:
                 sl.pop(index)
                 sl.add((w - pl[part], i))
                 solution[part] = i
-        
-        return self.parse_sol(solution)
+        return solution
 
     # Minimizing this is equivalent to minimizing sum of sizes of unused bins
     def loss(self, solution):
@@ -143,7 +142,7 @@ class problem:
             ans += f"Bar number {i} : {final[i][1][0]} Patterns:\n"
             for j in range(0, len(final[i][1][1])):
                 cnt, pat = final[i][1][1][j][0], final[i][1][1][j][1]
-                app = list(map(lambda x:self.inv_parts[x] + 1, pat))
+                app = list(map(lambda x:x, pat))
                 ans += f"{cnt}x {str(app)}\n"
         print(ans)
 
@@ -246,7 +245,7 @@ class problem:
             for item in range(len(d['parts'])):
                 if solver.value(x[item, bar]) > 0:
                     solution[item] = bar
-
+        print("Objective:", objective)
         return self.parse_sol(solution)
 
     def VP(self):
@@ -256,12 +255,23 @@ class problem:
         ws = [[[part]] for part, count in self.parts]
         b = [count for part, count in self.parts]
 
-        sol = mvpsolver.solve(Ws, Cs, Qs, ws, b, script="vpsolver_glpk.sh")
-
-        mvpsolver.print_solution(sol)
+        sol = mvpsolver.solve(Ws, Cs, Qs, ws, b, script="vpsolver_glpk.sh", verbose=False)
+        obj, lst_sol = sol
+        if obj is not None:
+            print("Objective:", obj)
+        print("Solution:")
+        for i, sol in enumerate(lst_sol):
+            cnt = sum(m for m, p in sol)
+            print("Bins of type {0}: {1} {2}".format(
+                Ws[i][0], cnt, ["bins", "bin"][cnt == 1]
+            ))
+            for mult, patt in sol:
+                print("{0} x [{1}]".format(
+                    mult, ", ".join(
+                        ["{0}".format(ws[it][0][0]) for it, opt in patt]
+                    )
+                ))
         return sol
-#Usage:
-#p = problem(TEST_CASE)
-#p.vp()
-#p.solve_sat()
-#p.largest_in_smallest()
+tc = test_data.TEST_DATA[5]
+#problem(tc).solver_sat()
+problem(tc).VP()
